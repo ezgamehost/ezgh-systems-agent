@@ -214,3 +214,50 @@ func TestMetadataReusesConnections(t *testing.T) {
 		t.Fatalf("%d connections for 5 requests", n)
 	}
 }
+
+// An IPv6-only guest has no route to the IPv4 address.
+func TestMetadataFallsBackWhenTheFirstAddressIsUnreachable(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.WriteString(w, `{"id":"ins_abcdefghijkl","project":"prj_abcdefghijkl","projectId":"01a0eb5f-2a53-74a7-a704-c7efc80b17cf"}`)
+	}))
+	defer srv.Close()
+	dead := httptest.NewServer(http.NotFoundHandler())
+	unreachable := dead.URL
+	dead.Close()
+
+	m := &Metadata{Endpoint: unreachable, Fallback: srv.URL}
+	if _, err := m.Project(context.Background()); err != nil || hits.Load() != 1 {
+		t.Fatalf("err = %v, fallback hits = %d", err, hits.Load())
+	}
+}
+
+// An answer is an answer: only an unreachable address moves on to the next.
+func TestMetadataKeepsARefusalFromTheFirstAddress(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("fallback used after the first address answered")
+	}))
+	defer second.Close()
+
+	m := &Metadata{Endpoint: first.URL, Fallback: second.URL}
+	if _, err := m.Project(context.Background()); err == nil {
+		t.Fatal("a 503 was accepted")
+	}
+}
+
+func TestMetadataDefaultGetsTheIPv6Fallback(t *testing.T) {
+	for _, endpoint := range []string{"", "http://169.254.169.254"} {
+		first, fallback := (&Metadata{Endpoint: endpoint}).endpoints()
+		if first != "http://169.254.169.254" || fallback != "http://[fd65:7a67:6800::254]" {
+			t.Fatalf("Endpoint %q: %q then %q", endpoint, first, fallback)
+		}
+	}
+	if _, fallback := (&Metadata{Endpoint: "http://metadata.example"}).endpoints(); fallback != "" {
+		t.Fatalf("a custom endpoint got fallback %q", fallback)
+	}
+}
